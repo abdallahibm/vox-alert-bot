@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -26,7 +27,15 @@ def check_interval(now=None):
     return {1: 300, 2: 300, 3: 300}.get(day, 600)
 
 KEYWORDS = ['concert', 'live viewing', 'world tour', 'live broadcast',
-            'live in cinemas', 'live performance', 'concert film', 'حفلة', 'حفل موسيقي']
+            'live in cinemas', 'live performance', 'concert film', 'حفلة', 'حفل موسيقي','Hadoota']
+
+# Exact VOX movie URL slugs to monitor in addition to concert/live-event titles.
+# Both Avengers: Doomsday listings are included (regular + Infinity Vision).
+TRACKED_MOVIE_SLUGS = {
+    'avengers-doomsday',
+    'avengers-doomsday-infinity-vision',
+    'dune-part-three',
+}
 
 
 def send_telegram(message):
@@ -44,6 +53,34 @@ def send_telegram(message):
     return success
 
 
+def send_telegram_long(message, limit=3800):
+    """Send a long Telegram report in safe-sized chunks to every recipient."""
+    if len(message) <= limit:
+        return send_telegram(message)
+
+    chunks = []
+    current = ''
+    for block in message.split('\n\n'):
+        candidate = block if not current else current + '\n\n' + block
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            while len(block) > limit:
+                chunks.append(block[:limit])
+                block = block[limit:]
+            current = block
+    if current:
+        chunks.append(current)
+
+    success = True
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, 1):
+        success = send_telegram(f'📢 COMING SOON ({index}/{total})\n\n' + chunk) and success
+    return success
+
+
 def load_data():
     if DATA_FILE.exists():
         return json.loads(DATA_FILE.read_text(encoding='utf-8'))
@@ -58,9 +95,52 @@ def save_data(data):
 
 
 def get_page(url):
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, 'html.parser')
+    """Fetch a VOX page with one cautious retry for transient failures.
+
+    A 403 is retried once after a short pause in case it was transient.
+    If VOX continues to refuse access, the error is raised; this code does
+    not attempt to bypass access controls, rotate IPs, or disguise requests.
+    """
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(url, timeout=30)
+            status = response.status_code
+
+            if status == 403:
+                print(f'VOX returned HTTP 403 for {url} (attempt {attempt}/{max_attempts}).')
+                if attempt < max_attempts:
+                    time.sleep(20)
+                    continue
+                response.raise_for_status()
+
+            if status == 429:
+                retry_after = response.headers.get('Retry-After', '')
+                try:
+                    wait_seconds = min(max(int(retry_after), 5), 60)
+                except (TypeError, ValueError):
+                    wait_seconds = 30
+                print(f'VOX rate-limited the request (429); waiting {wait_seconds}s.')
+                if attempt < max_attempts:
+                    time.sleep(wait_seconds)
+                    continue
+                response.raise_for_status()
+
+            if 500 <= status <= 599 and attempt < max_attempts:
+                print(f'VOX server error {status} for {url}; retrying in 10s.')
+                time.sleep(10)
+                continue
+
+            response.raise_for_status()
+            return BeautifulSoup(response.text, 'html.parser')
+
+        except (requests.Timeout, requests.ConnectionError) as error:
+            print(f'{type(error).__name__} for {url} (attempt {attempt}/{max_attempts}): {error}')
+            if attempt >= max_attempts:
+                raise
+            time.sleep(5)
+
+    raise RuntimeError(f'Unable to retrieve VOX page after {max_attempts} attempts: {url}')
 
 
 def get_concerts(page_url=VOX_URL):
@@ -76,7 +156,10 @@ def get_concerts(page_url=VOX_URL):
         if urlparse(url).netloc != urlparse(VOX_URL).netloc or not urlparse(url).path.startswith('/movies/'):
             continue
         listing_count += 1
-        if any(word in title.lower() for word in KEYWORDS):
+        slug = urlparse(url).path.rstrip('/').split('/')[-1].lower()
+        is_concert_or_live_event = any(word in title.lower() for word in KEYWORDS)
+        is_tracked_movie = slug in TRACKED_MOVIE_SLUGS
+        if is_concert_or_live_event or is_tracked_movie:
             concerts[url] = title
     if not listing_count:
         raise RuntimeError('No movie listings found.')
@@ -155,7 +238,7 @@ def check_updates():
     new_concerts = new_sessions = 0
     for movie_url, title in concerts.items():
         if movie_url not in data['concerts']:
-            message = f'🎵 NEW CONCERT DETECTED!\n\n🎬 {title}\n\n🔗 {movie_url}'
+            message = f'🎬 NEW MONITORED TITLE DETECTED!\n\n🎬 {title}\n\n🔗 {movie_url}'
             if first_run or send_telegram(message):
                 data['concerts'].append(movie_url)
                 new_concerts += 1
@@ -165,7 +248,7 @@ def check_updates():
             if session_id in data['sessions']:
                 continue
             message = (
-                '🚨 NEW CONCERT SHOWTIME!\n\n'
+                '🚨 NEW SHOWTIME AVAILABLE!\n\n'
                 f'🎬 {title}\n'
                 f"📍 {info['cinema']}\n"
                 f"📅 {info['date']}\n"
@@ -187,20 +270,56 @@ def check_updates():
                       f"🎟 Existing sessions: {len(data['sessions'])}\n\n"
                       'Your monitoring baseline is ready.')
 
-    time.sleep(3)
     upcoming = get_concerts(COMING_URL)
-    print(f'Coming soon concerts: {len(upcoming)}')
-    for url, title in upcoming.items():
-        if url in data['coming']:
-            continue
-        if coming_first or url in data['concerts'] or send_telegram(
-                f'📢 UPCOMING CONCERT ANNOUNCED!\n\n🎬 {title}\n'
-                f'Tickets may not be available yet.\n🔗 {url}'):
-            data['coming'].append(url)
+    print(f'Coming soon monitored titles: {len(upcoming)}')
+
+    if upcoming:
+        print('Coming soon titles:')
+        for index, (url, title) in enumerate(upcoming.items(), 1):
+            print(f'  {index}. {title}')
+            print(f'     {url}')
+    else:
+        print('No matching monitored titles found in Coming Soon.')
+
+    # Send a consolidated Telegram report only when the monitored Coming Soon
+    # list changes. This avoids repeating the same report every scan.
+    upcoming_items = sorted(
+        ((url, title) for url, title in upcoming.items()),
+        key=lambda item: item[1].casefold()
+    )
+    digest_source = "\n".join(f"{title}|{url}" for url, title in upcoming_items)
+    coming_digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    previous_digest = data.get('coming_digest')
+
+    if coming_digest != previous_digest:
+        if upcoming_items:
+            lines = [
+                '📢 VOX CINEMAS — COMING SOON',
+                '',
+                f'Found {len(upcoming_items)} monitored title(s):',
+                ''
+            ]
+            for index, (url, title) in enumerate(upcoming_items, 1):
+                lines.append(f'{index}. 🎬 {title}')
+                lines.append(f'🔗 {url}')
+                lines.append('')
+            report = "\n".join(lines).strip()
+        else:
+            report = (
+                '📢 VOX CINEMAS — COMING SOON\n\n'
+                'No monitored titles are currently listed in Coming Soon.'
+            )
+
+        if send_telegram_long(report):
+            data['coming_digest'] = coming_digest
+            data['coming'] = list(upcoming.keys())
+            data['coming_initialized'] = True
             save_data(data)
-    if coming_first:
-        data['coming_initialized'] = True
-        save_data(data)
+            print('Coming Soon Telegram report: delivered to all configured recipients.')
+        else:
+            print('Coming Soon Telegram report: delivery failed; it will be retried next scan.')
+    else:
+        print('Coming Soon list unchanged; no duplicate Telegram report sent.')
 
     # A successful full scan can send one heartbeat in each Cairo hour window.
     now = datetime.now(CAIRO)
@@ -258,7 +377,7 @@ def main():
                 raise SystemExit(1)
             failures += 1
         except Exception as error:
-            print(f'Check failed: {type(error).__name__}')
+            print(f'Check failed: {type(error).__name__}: {error}')
             failures += 1
         if failures >= 2 and not warned:
             warned = send_telegram('⚠️ VOX monitoring has failed repeatedly. Retrying with backoff.')
