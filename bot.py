@@ -27,7 +27,7 @@ def check_interval(now=None):
     return {1: 300, 2: 300, 3: 300}.get(day, 600)
 
 KEYWORDS = ['concert', 'live viewing', 'world tour', 'live broadcast',
-            'live in cinemas', 'live performance', 'concert film', 'حفلة', 'حفل موسيقي','Hadoota']
+            'live in cinemas', 'live performance', 'concert film', 'حفلة', 'حفل موسيقي','Hadoota','lela-bazit-khalis-arabic']
 
 # Exact VOX movie URL slugs to monitor in addition to concert/live-event titles.
 # Both Avengers: Doomsday listings are included (regular + Infinity Vision).
@@ -35,6 +35,8 @@ TRACKED_MOVIE_SLUGS = {
     'avengers-doomsday',
     'avengers-doomsday-infinity-vision',
     'dune-part-three',
+    'lela-bazit-khalis-arabic',
+    'hadoota-arabic'
 }
 
 
