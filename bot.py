@@ -35,7 +35,6 @@ TRACKED_MOVIE_SLUGS = {
     'avengers-doomsday',
     'avengers-doomsday-infinity-vision',
     'dune-part-three',
-    'hadoota-arabic',
 }
 
 
@@ -224,11 +223,57 @@ def get_showtimes(movie_url):
     return sessions
 
 
+
+# Only these cinemas are included in showtime alerts. The scraper still scans
+# every monitored title and every date page before notification filtering.
+TARGET_CINEMA_TERMS = (
+    'city centre almaza',
+    'city center almaza',
+    'mall of egypt',
+    'mall masr',
+)
+
+
+def is_target_cinema(cinema_name):
+    normalized = ' '.join((cinema_name or '').casefold().replace('-', ' ').split())
+    return any(term in normalized for term in TARGET_CINEMA_TERMS)
+
+
+def build_movie_day_message(title, screening_date, sessions):
+    """Build one compact Telegram message for one movie on one date."""
+    grouped_cinemas = {}
+    for info in sessions:
+        grouped_cinemas.setdefault(info['cinema'], []).append(info)
+
+    lines = [
+        '🚨 NEW SHOWTIMES AVAILABLE!',
+        '',
+        f'🎬 {title}',
+        f'📅 {screening_date}',
+        '',
+    ]
+    for cinema in sorted(grouped_cinemas, key=str.casefold):
+        lines.append(f'📍 {cinema}')
+        ordered = sorted(
+            grouped_cinemas[cinema],
+            key=lambda item: (item['time'].casefold(), item['format'].casefold())
+        )
+        for info in ordered:
+            lines.append(f"• {info['time']} — {info['format']}")
+            lines.append(f"  🎟 {info['url']}")
+        lines.append('')
+    return '\n'.join(lines).strip()
+
+
 def check_updates():
     first_run = not DATA_FILE.exists()
     data = load_data()
-    coming_first = not data.get('coming_initialized', False)
+    data.setdefault('concerts', [])
+    data.setdefault('sessions', [])
     data.setdefault('coming', [])
+
+    # DETECTION STAGE: intentionally unchanged. Discover all matching titles,
+    # then fetch every monitored movie page and every available date page.
     concerts = get_concerts()
     print(f'Concerts found: {len(concerts)}')
     current_sessions = {}
@@ -236,35 +281,74 @@ def check_updates():
         print(f'Concert: {title}')
         time.sleep(2)
         current_sessions[movie_url] = get_showtimes(movie_url)
+
     new_concerts = new_sessions = 0
+    pending_by_movie_day = {}
+    sessions_to_mark_seen = []
+
+    # NOTIFICATION STAGE: consolidate only after the full scan is complete.
     for movie_url, title in concerts.items():
         if movie_url not in data['concerts']:
             message = f'🎬 NEW MONITORED TITLE DETECTED!\n\n🎬 {title}\n\n🔗 {movie_url}'
             if first_run or send_telegram(message):
                 data['concerts'].append(movie_url)
                 new_concerts += 1
-                if not first_run:
-                    save_data(data)
+
         for session_id, info in current_sessions[movie_url].items():
             if session_id in data['sessions']:
                 continue
-            message = (
-                '🚨 NEW SHOWTIME AVAILABLE!\n\n'
-                f'🎬 {title}\n'
-                f"📍 {info['cinema']}\n"
-                f"📅 {info['date']}\n"
-                f"⏰ {info['time']}\n"
-                f"🎥 {info['format']}\n\n"
-                f"🎟 Open booking page:\n{info['url']}"
+
+            new_sessions += 1
+
+            # Keep monitoring coverage intact, but only notify for the two
+            # requested cinemas. Other cinema sessions are recorded silently.
+            if not is_target_cinema(info.get('cinema', '')):
+                sessions_to_mark_seen.append(session_id)
+                continue
+
+            key = (movie_url, title, info.get('date', 'Check booking page'))
+            pending_by_movie_day.setdefault(key, []).append(
+                {'session_id': session_id, **info}
             )
-            if first_run or send_telegram(message):
-                data['sessions'].append(session_id)
-                new_sessions += 1
-                if not first_run:
-                    save_data(data)
+
+    if first_run:
+        # Establish the baseline without sending historical showtime alerts.
+        sessions_to_mark_seen.extend(
+            session_id
+            for movie_sessions in current_sessions.values()
+            for session_id in movie_sessions
+        )
+    else:
+        # Exactly one Telegram send per movie per screening date, regardless
+        # of the number of showtimes or cinema categories in that group.
+        for (movie_url, title, screening_date), grouped_sessions in pending_by_movie_day.items():
+            message = build_movie_day_message(
+                title, screening_date, grouped_sessions
+            )
+            if send_telegram(message):
+                sessions_to_mark_seen.extend(
+                    item['session_id'] for item in grouped_sessions
+                )
+            else:
+                print(
+                    f'Grouped showtime alert failed: {title} | {screening_date}. '
+                    'These sessions remain pending for the next scan.'
+                )
+
+    # Persist all successfully delivered/ignored sessions in one atomic save,
+    # rather than writing the history file once per showtime.
+    existing_session_ids = set(data['sessions'])
+    for session_id in sessions_to_mark_seen:
+        if session_id not in existing_session_ids:
+            data['sessions'].append(session_id)
+            existing_session_ids.add(session_id)
+
     save_data(data)
     print(f'New concerts: {new_concerts}')
-    print(f'New sessions: {new_sessions}')
+    print(f'New sessions detected: {new_sessions}')
+    print(f'Grouped movie/date alerts prepared: {len(pending_by_movie_day)}')
+    print(f'Grouped movie/date alerts sent or pending: {len(pending_by_movie_day)}')
+
     if first_run:
         send_telegram('✅ VOX Alert Bot initialized!\n\n'
                       f"🎵 Existing concerts: {len(data['concerts'])}\n"
