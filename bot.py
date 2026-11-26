@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+CHAT_IDS = list(dict.fromkeys(x.strip() for x in os.getenv('TELEGRAM_CHAT_ID', '').split(',') if x.strip()))
 VOX_URL = 'https://egy.voxcinemas.com/movies/whatson'
 DATA_FILE = Path(os.getenv('VOX_DATA_FILE', str(BASE_DIR / 'seen_data.json')))
 COMING_URL = 'https://egy.voxcinemas.com/movies/comingsoon'
@@ -23,21 +23,25 @@ CAIRO = ZoneInfo('Africa/Cairo')
 
 def check_interval(now=None):
     day = (now or datetime.now(CAIRO)).weekday()
-    return {1: 300, 2: 60, 3: 300}.get(day, 600)
+    return {1: 300, 2: 300, 3: 300}.get(day, 600)
 
 KEYWORDS = ['concert', 'live viewing', 'world tour', 'live broadcast',
             'live in cinemas', 'live performance', 'concert film', 'حفلة', 'حفل موسيقي']
 
 
 def send_telegram(message):
-    try:
-        response = requests.post(
-            f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-            data={'chat_id': CHAT_ID, 'text': message}, timeout=30)
-        return response.ok and response.json().get('ok', False)
-    except (requests.RequestException, ValueError):
-        print('Telegram notification failed.')
-        return False
+    success = True
+    for index, chat_id in enumerate(CHAT_IDS, 1):
+        try:
+            response = requests.post(
+                f'https://api.telegram.org/bot{TOKEN}/sendMessage',
+                data={'chat_id': chat_id, 'text': message}, timeout=30)
+            delivered = response.ok and response.json().get('ok', False)
+        except (requests.RequestException, ValueError):
+            delivered = False
+        print(f'Telegram recipient {index}: ' + ('delivered' if delivered else 'failed'))
+        success = success and delivered
+    return success
 
 
 def load_data():
@@ -198,6 +202,26 @@ def check_updates():
         data['coming_initialized'] = True
         save_data(data)
 
+    # A successful full scan can send one heartbeat in each Cairo hour window.
+    now = datetime.now(CAIRO)
+    if now.hour in (0, 12):
+        slot = now.strftime('%Y-%m-%d %H')
+        if data.get('last_health_slot') != slot:
+            message = (
+                '✅ VOX BOT STATUS: ONLINE\n\n'
+                f'🕒 Successful scan: {now:%d %b %Y %I:%M %p} Cairo\n'
+                f'🎵 Current concerts: {len(concerts)}\n'
+                f'🎟 Current sessions: {sum(len(x) for x in current_sessions.values())}\n'
+                f'📢 Coming soon concerts: {len(upcoming)}\n'
+                f'🆕 New sessions this scan: {new_sessions}\n'
+                'Website scan completed successfully.'
+            )
+            if send_telegram(message):
+                data['last_health_slot'] = slot
+                save_data(data)
+            else:
+                raise RuntimeError('Health notification delivery failed.')
+
 
 def main():
     import argparse
@@ -205,15 +229,15 @@ def main():
     parser.add_argument('--once', action='store_true', help='Run one scan and exit')
     parser.add_argument('--test-telegram', action='store_true')
     args = parser.parse_args()
-    if not TOKEN or not CHAT_ID:
+    if not TOKEN or not CHAT_IDS:
         raise SystemExit('Missing Telegram credentials.')
     if args.test_telegram:
-        if not send_telegram('✅ VOX Alert Bot v3: Telegram test successful.'):
+        if not send_telegram('✅ VOX Alert Bot v4: Telegram test successful.'):
             raise SystemExit('Telegram test failed.')
         return
     if not args.once and not MONITOR_ALLOWED:
         raise SystemExit('Confirm VOX permits automated monitoring, then set VOX_MONITOR_ALLOWED=true in .env.')
-    print('VOX ALERT BOT V3 STARTED')
+    print('VOX ALERT BOT V4 STARTED')
     print('Press Ctrl+C to stop.')
     failures = 0
     warned = False
@@ -231,7 +255,7 @@ def main():
             print(f'Website HTTP error: {status}')
             if status in (401, 403, 429):
                 send_telegram(f'⚠️ VOX monitoring stopped: HTTP {status}. Check access permissions before restarting.')
-                return
+                raise SystemExit(1)
             failures += 1
         except Exception as error:
             print(f'Check failed: {type(error).__name__}')
