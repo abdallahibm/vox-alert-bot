@@ -35,6 +35,7 @@ TRACKED_MOVIE_SLUGS = {
     'avengers-doomsday',
     'avengers-doomsday-infinity-vision',
     'dune-part-three',
+    'hadoota-arabic',
 }
 
 
